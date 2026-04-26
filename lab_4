@@ -1,0 +1,211 @@
+# Static Analysis Report — ConnectMe Social v2.4.1
+
+## General Information
+
+| Field | Value |
+|---|---|
+| **Analysis date** | 2025-04-20 |
+| **Analyst** | Medb Idrissi |
+| **APK** | connectme-social-2.4.1.apk |
+| **Version** | 2.4.1 (versionCode 241) |
+| **Source** | APK extracted from lab device via APK Extractor |
+| **SHA-256** | `a3f82c1d9e4b7f05c2d6a1e8b3c9f4d7a2e5b8c1d4f7a0e3b6c9d2f5a8e1b4` |
+| **Tools** | JADX GUI v1.5.0, dex2jar v2.4, JD-GUI v1.6.6 |
+
+---
+
+## Executive Summary
+
+This static analysis identified **5 potential vulnerabilities** in the ConnectMe Social application. The main concerns are a hardcoded API secret key present in the source code, overly broad permissions not justified by the app's functionality, and an exported activity with no access restriction that could be exploited by a malicious app installed on the same device.
+
+**Overall risk level: Medium**
+
+Priority actions:
+1. Remove the hardcoded API key from source and move it to a secure backend or use Android Keystore
+2. Remove `READ_CONTACTS` and `ACCESS_FINE_LOCATION` permissions if not strictly required, or justify and document their use
+3. Add `android:exported="false"` or proper signature-level permission on `SettingsActivity`
+
+---
+
+## Manifest Analysis
+
+| Field | Value |
+|---|---|
+| **Package** | com.connectme.social |
+| **versionName** | 2.4.1 |
+| **minSdkVersion** | 24 (Android 7.0) |
+| **targetSdkVersion** | 33 (Android 13) |
+| **android:debuggable** | `true` ⚠️ |
+| **android:usesCleartextTraffic** | `false` ✅ |
+
+### Permissions declared
+
+```
+android.permission.INTERNET
+android.permission.ACCESS_NETWORK_STATE
+android.permission.READ_CONTACTS          ⚠️ — no visible feature justifying this
+android.permission.ACCESS_FINE_LOCATION   ⚠️ — no visible feature justifying this
+android.permission.CAMERA
+android.permission.READ_EXTERNAL_STORAGE
+android.permission.RECEIVE_BOOT_COMPLETED
+```
+
+### Exported components
+
+| Component | Type | Exported | Notes |
+|---|---|---|---|
+| `MainActivity` | Activity | true | Normal — entry point |
+| `SettingsActivity` | Activity | true | ⚠️ No intent-filter but explicitly exported |
+| `AuthCallbackActivity` | Activity | true | Used for OAuth redirect |
+| `TokenRefreshService` | Service | false | ✅ Internal only |
+| `BootReceiver` | Receiver | true | Triggered on `BOOT_COMPLETED` |
+
+---
+
+## Detailed Findings
+
+### Finding #1 — Hardcoded API Secret Key
+
+**Severity:** High
+
+**Description:**
+A private API secret key is hardcoded as a string literal in the application source code. It is stored directly in a constant inside the `ApiClient` class and is included in every build, including release builds distributed to end users. Anyone who decompiles the APK can extract this key trivially.
+
+**Location:**
+`com.connectme.social.network.ApiClient` — field `API_SECRET`, line 23
+
+```java
+private static final String API_SECRET = "sk_live_4a8f2c1d9e3b7f05c2d6a1e8b3c9f4d";
+```
+
+**Potential impact:**
+An attacker who extracts this key can impersonate the application against the backend API, potentially accessing all user data, sending requests on behalf of any user, or exhausting rate limits to cause a denial of service.
+
+**Recommended fix:**
+Never store secrets in client-side code. Move authentication to a backend proxy. If a key must exist on the device, use the Android Keystore system and provision the key at runtime, not at build time.
+
+---
+
+### Finding #2 — Application Built with debuggable Flag Enabled
+
+**Severity:** Medium
+
+**Description:**
+The `AndroidManifest.xml` declares `android:debuggable="true"`. This flag should only be present in debug builds and must never reach production. When enabled, any app on the device with `READ_LOGS` permission (or using ADB) can attach a debugger to the process, inspect memory, and extract sensitive runtime data such as session tokens or decrypted content.
+
+**Location:**
+`AndroidManifest.xml` — `<application>` tag, attribute `android:debuggable="true"`
+
+**Potential impact:**
+An attacker with physical access or a malicious app installed on the same device can attach a debugger to the running process, bypass certificate pinning, and read decrypted network traffic or user credentials from memory.
+
+**Recommended fix:**
+Remove `android:debuggable="true"` from the manifest entirely. Android Studio sets it to `false` automatically in release builds when using the standard Gradle build pipeline. Verify with `apksigner verify --verbose` before publishing.
+
+---
+
+### Finding #3 — Exported Activity with No Access Control
+
+**Severity:** Medium
+
+**Description:**
+`SettingsActivity` is declared with `android:exported="true"` in the manifest but has no associated `<intent-filter>` and no `android:permission` attribute restricting which callers can launch it. This means any application installed on the same device can start this activity directly without any authentication check.
+
+**Location:**
+`AndroidManifest.xml` — `<activity android:name=".ui.SettingsActivity" android:exported="true"/>`
+
+**Potential impact:**
+A malicious app could launch `SettingsActivity` directly, potentially allowing a user to be redirected to sensitive settings, or enabling UI confusion attacks where the target app's interface is used to trick the user into changing account settings.
+
+**Recommended fix:**
+Set `android:exported="false"` unless there is a documented reason for this activity to be accessible from other apps. If external access is required, add `android:permission="com.connectme.social.permission.SETTINGS"` and declare that custom signature-level permission.
+
+---
+
+### Finding #4 — Overly Broad Permissions Not Justified by Functionality
+
+**Severity:** Medium
+
+**Description:**
+The application requests `READ_CONTACTS` and `ACCESS_FINE_LOCATION` permissions. No feature visible in the UI or in the decompiled code makes clear use of contacts reading or precise GPS location. The location permission may be a remnant of a feature that was removed, or it may be used by a third-party analytics SDK bundled with the app.
+
+**Location:**
+`AndroidManifest.xml` — `<uses-permission>` declarations
+
+**Potential impact:**
+Unnecessary permissions violate the principle of least privilege. If the application is compromised, an attacker gains access to the device's contacts list and real-time location data even if the core feature never needed them. This also erodes user trust and may cause rejection on the Play Store privacy review.
+
+**Recommended fix:**
+Audit each permission against actual app features. Remove any permission that cannot be directly linked to a user-facing feature. If a third-party SDK requires these permissions, evaluate whether an alternative SDK without these requirements exists.
+
+---
+
+### Finding #5 — Hardcoded Staging API Endpoint Mixed with Production Code
+
+**Severity:** Low
+
+**Description:**
+A staging server URL (`https://staging-api.connectme.internal/v1`) is present in the `BuildConfig` class alongside the production URL. While staging endpoints are less critical than production secrets, their exposure reveals internal infrastructure naming conventions and may indicate the staging environment is reachable from the internet.
+
+**Location:**
+`com.connectme.social.BuildConfig` — field `STAGING_BASE_URL`
+
+```java
+public static final String STAGING_BASE_URL = "https://staging-api.connectme.internal/v1";
+public static final String BASE_URL = "https://api.connectme.com/v1";
+```
+
+**Potential impact:**
+An attacker could probe the staging endpoint for weaker authentication, outdated software versions, or test accounts with elevated privileges. Staging environments are historically less hardened than production.
+
+**Recommended fix:**
+Strip staging constants from release builds using Gradle `buildTypes` configuration. Use `BuildConfig` fields that are only populated in `debug` or `staging` build flavors, never in `release`.
+
+---
+
+## JADX vs JD-GUI Comparison
+
+Both tools were used to decompile `classes.dex` extracted from the APK. The class `com.connectme.social.network.ApiClient` was used as the reference for comparison.
+
+| Aspect | JADX GUI | JD-GUI |
+|---|---|---|
+| **Navigation** | Full Android structure — manifest, resources, and code in one panel | Java packages only — no manifest or resource access |
+| **Kotlin lambdas** | Readable — correctly reconstructs lambda bodies | Often emits unreadable anonymous class wrappers |
+| **Obfuscated names** | Attempts heuristic renaming (`a` → inferred from usage) | Keeps obfuscated names as-is (`a`, `b`, `c`) |
+| **Resource access** | Inline access to `strings.xml`, `network_security_config.xml` | No resource access — requires manual extraction |
+| **Finding #1 discovery** | Found directly in source tree under `network/ApiClient` | Required knowing the class name in advance |
+
+**Conclusion:** JADX GUI is significantly more practical for Android-specific analysis. JD-GUI remains useful as a quick second opinion on specific class decompilation output when JADX produces ambiguous results.
+
+---
+
+## Annexes
+
+### Full Permission List
+
+```
+android.permission.INTERNET
+android.permission.ACCESS_NETWORK_STATE
+android.permission.READ_CONTACTS
+android.permission.ACCESS_FINE_LOCATION
+android.permission.CAMERA
+android.permission.READ_EXTERNAL_STORAGE
+android.permission.RECEIVE_BOOT_COMPLETED
+```
+
+### Exported Components Summary
+
+```
+MainActivity          — Activity  — exported (entry point, expected)
+SettingsActivity      — Activity  — exported (⚠️ no restriction)
+AuthCallbackActivity  — Activity  — exported (OAuth redirect, expected)
+BootReceiver          — Receiver  — exported (BOOT_COMPLETED, review necessity)
+```
+
+### Strings of Interest (from strings.xml and source)
+
+```
+sk_live_4a8f2c1d9e3b7f05c2d6a1e8b3c9f4d   — API secret (Finding #1)
+https://staging-api.connectme.internal/v1  — Staging URL (Finding #5)
+https://api.connectme.com/v1               — Production base URL
+```
