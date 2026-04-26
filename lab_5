@@ -1,0 +1,396 @@
+# LAB 5 — Reverse Engineering : OWASP UnCrackable Level 2
+
+---
+
+## Overview
+
+This lab analyzes an Android application that hides its validation logic inside a **native library**. The app looks simple — a text field and a button — but the real check happens in compiled C/C++ code, not in Java. The goal is to trace the input from the UI all the way to the native comparison and extract the secret string.
+
+**Verification flow:**
+
+```
+User input
+   ↓
+MainActivity
+   ↓
+CodeCheck.a(...)
+   ↓
+CodeCheck.bar(...)      ← native method
+   ↓
+libfoo.so
+   ↓
+strncmp(input, secret)
+   ↓
+success / failure
+```
+
+**Expected secret:** `Thanks for all the fish`
+
+---
+
+## Learning Objectives
+
+By the end of this lab you will be able to:
+
+- Understand the role of an APK in Android
+- Observe app behavior before reading any code
+- Identify the validation entry point in `MainActivity`
+- Recognize native library loading via `System.loadLibrary`
+- Understand what a `native` method declaration means in Java
+- Locate a `.so` file inside an APK
+- Open a native library in Ghidra
+- Find an exported JNI function
+- Spot a `strncmp` string comparison in decompiled code
+- Decode a hex ASCII value
+- Retrieve and validate the final secret
+
+---
+
+## Prerequisites
+
+- General idea of how an Android app works
+- Ability to run commands in a terminal
+- Know how to install an APK on an emulator with `adb`
+- Basic Java familiarity — enough to recognize a class and a method
+
+---
+
+## Tools Required
+
+| Tool | Purpose |
+|---|---|
+| Android emulator or lab device | Runtime target |
+| `adb` | APK installation and device communication |
+| JADX GUI | Java decompiler — reads the APK's Java layer |
+| Ghidra | Native binary analysis — reads the `.so` library |
+| `unzip` | Extract APK contents |
+
+> Android apps can embed compiled native code as ELF `.so` libraries, loaded at runtime via JNI. This is exactly what UnCrackable Level 2 does.
+
+---
+
+## Part 1 — Discover the Application
+
+### Step 1 — Install and launch the APK
+
+The first step is to install the app and observe its interface. Do not look at the code yet. A good analysis always starts with what the user sees.
+
+```bash
+adb install UnCrackable-Level2.apk
+```
+
+Then launch the app on the emulator.
+
+**What to observe:** A simple screen with a text input field and a verify button. The challenge is to find the exact string this field expects.
+
+**Checkpoint:** App is installed and the interface is visible.
+
+---
+
+### Step 2 — Test incorrect values
+
+Before opening any code, confirm that the app actually compares your input against an expected value.
+
+Enter these strings one by one and tap verify each time:
+
+```
+test
+1234
+hello
+android
+```
+
+**What to observe:** Each wrong input triggers an error message. This confirms there is a comparison happening somewhere — and therefore a secret stored somewhere.
+
+**Checkpoint:** It is clear the app expects one specific string.
+
+---
+
+## Part 2 — Find Where Validation Starts
+
+### Step 3 — Decompile the APK with JADX
+
+```bash
+jadx-gui UnCrackable-Level2.apk
+```
+
+Navigate to `MainActivity` in the left panel.
+
+**What to observe:** `MainActivity` is the entry point on the UI side. It reads the user's input and passes it to the validation logic.
+
+**Checkpoint:** `MainActivity` is identified in JADX.
+
+---
+
+### Step 4 — Locate the validation call in MainActivity
+
+Inside `MainActivity`, find the method that handles the verify button. Look for where the text field value is read and passed on.
+
+**What to observe:** The string is passed to a method like `m.a(...)`, meaning another object handles the actual check.
+
+**Conceptual example of what this looks like:**
+
+```java
+String userInput = editText.getText().toString();
+if (m.a(userInput)) {
+    // success
+} else {
+    // error
+}
+```
+
+**What this means:** The validation is not done inside `MainActivity` itself. The input travels to another class. Follow it.
+
+**Checkpoint:** It is confirmed that `MainActivity` delegates the check.
+
+---
+
+## Part 3 — Understand the Role of CodeCheck
+
+### Step 5 — Identify the class that performs the check
+
+In JADX, search for the class `CodeCheck`. This class is the bridge between Java and the native code.
+
+**What to observe:** The class contains two key elements:
+
+```java
+public class CodeCheck {
+    static {
+        System.loadLibrary("foo");   // loads libfoo.so at runtime
+    }
+
+    private native boolean bar(String s);   // implemented in C, not Java
+
+    public boolean a(String s) {
+        return bar(s);
+    }
+}
+```
+
+**Why the `native` keyword matters:** A method declared `native` has no Java body. Its actual code lives in a compiled library — here `libfoo.so`. This is the JNI mechanism.
+
+**Why this step is important:** The secret will not be visible in any Java class. You have to open the native library to find it.
+
+**Checkpoint:** It is clear the real check happens in the native library.
+
+---
+
+## Part 4 — Locate the Native Library
+
+### Step 6 — Extract the APK contents
+
+`System.loadLibrary("foo")` means a file named `libfoo.so` is packaged inside the APK.
+
+```bash
+unzip UnCrackable-Level2.apk -d uncrackable_l2
+ls -R uncrackable_l2/lib
+```
+
+**What to observe:** The `lib/` folder contains architecture-specific subfolders, each with a copy of `libfoo.so`:
+
+```
+lib/
+  armeabi-v7a/
+    libfoo.so
+  arm64-v8a/
+    libfoo.so
+  x86/
+    libfoo.so
+  x86_64/
+    libfoo.so
+```
+
+Android ships multiple versions of the same library to support different CPU architectures. For static analysis, any one version works — use `x86` if you are on an x86 emulator.
+
+**Checkpoint:** `libfoo.so` is located.
+
+---
+
+## Part 5 — Analyze the Native Code with Ghidra
+
+### Step 7 — Import libfoo.so into Ghidra
+
+> Ghidra is a free reverse engineering tool developed by the NSA. It includes a disassembler and a decompiler that produce readable pseudo-code from compiled binaries.
+
+Launch Ghidra:
+
+```bash
+# Windows
+ghidraRun.bat
+
+# Linux/macOS
+./ghidraRun
+```
+
+Create a new project, then import:
+
+```
+uncrackable_l2/lib/x86/libfoo.so
+```
+
+When prompted, run the **auto-analysis** with default settings. Let it complete before proceeding.
+
+**What to observe:** Ghidra loads all functions, symbols, and strings from the binary and produces decompiled pseudo-code for each function.
+
+**Checkpoint:** `libfoo.so` is loaded and analyzed in Ghidra.
+
+---
+
+### Step 8 — Find the JNI function linked to `bar`
+
+JNI functions follow a strict naming convention derived from the Java package, class, and method name. In the Symbol Tree or via **Search > For Symbols**, look for:
+
+```
+Java_sg_vantagepoint_uncrackable2_CodeCheck_bar
+```
+
+You can filter with `Java_` or `CodeCheck_bar` to narrow results quickly.
+
+**What to observe:** The function with this long name is the native implementation of `CodeCheck.bar()` on the Java side. Despite the intimidating name, it is just the C function that receives the user's input string.
+
+**Checkpoint:** The native verification function is identified.
+
+---
+
+## Part 6 — Understand the strncmp Comparison
+
+### Step 9 — Read the pseudo-code of the native function
+
+Open the decompiler view for `Java_sg_vantagepoint_uncrackable2_CodeCheck_bar` and look for calls to `strncmp`.
+
+**What to observe:** The function calls `strncmp` to compare the user input against a reference string. `strncmp` compares two strings up to a given length and returns 0 if they match.
+
+**What this means:** A secret string is stored somewhere in the library and passed as the second argument to `strncmp`. Find that string and the challenge is solved.
+
+> You do not need to understand the entire pseudo-code. Focus on the `strncmp` call and identify its arguments.
+
+**Checkpoint:** A hidden string is confirmed to be used as the comparison reference.
+
+---
+
+### Step 10 — Retrieve the compared value
+
+Following the data used in `strncmp`, Ghidra reveals a hex ASCII value:
+
+```
+6873696620656874206c6c6120726f6620736b6e616854
+```
+
+**What to observe:** In native libraries, strings are not always stored as visible text. They can appear as raw bytes in hex. Each two-character pair is one ASCII character.
+
+**Checkpoint:** The encoded string is identified.
+
+---
+
+## Part 7 — Decode the Secret
+
+### Step 11 — Convert hex to ASCII
+
+```python
+hex_data = "6873696620656874206c6c6120726f6620736b6e616854"
+print(bytes.fromhex(hex_data).decode("ascii"))
+```
+
+**Output:**
+
+```
+hsif eht lla rof sknahT
+```
+
+Each hex pair maps to one ASCII character. The result is a readable phrase — but something is off. It reads backwards.
+
+**Checkpoint:** The intermediate ASCII string is obtained.
+
+---
+
+### Step 12 — Reverse the string to get the final secret
+
+The string was stored reversed to make discovery slightly less immediate. Reverse it:
+
+```python
+s = "hsif eht lla rof sknahT"
+print(s[::-1])
+```
+
+**Output:**
+
+```
+Thanks for all the fish
+```
+
+**Checkpoint:** The correct secret is known.
+
+---
+
+## Part 8 — Validate the Solution
+
+### Step 13 — Enter the secret in the app
+
+Go back to the running application and type the following in the text field:
+
+```
+Thanks for all the fish
+```
+
+**What to observe:** The app accepts the input and displays a success message.
+
+**What this confirms:** Static analysis of the native library was enough to recover the secret without running or patching any code.
+
+**Final checkpoint: challenge solved.**
+
+---
+
+## Application Flow Summary
+
+```
+User types input
+       ↓
+MainActivity reads the EditText value
+       ↓
+Calls CodeCheck.a(input)
+       ↓
+CodeCheck.a() calls native method bar(input)
+       ↓
+JNI bridges to libfoo.so
+       ↓
+Java_..._CodeCheck_bar runs in native code
+       ↓
+strncmp(input, "Thanks for all the fish")
+       ↓
+returns true → success   /   false → error message
+```
+
+---
+
+## Key Takeaways
+
+Sensitive logic can be moved from Java into native code. This makes analysis harder but not impossible. The method stays the same:
+
+1. Observe behavior before reading code
+2. Follow the user input through the Java layer
+3. Identify the class that bridges to native (`CodeCheck`)
+4. Spot the `System.loadLibrary` call and the `native` method
+5. Extract the `.so` from the APK
+6. Open it in Ghidra and run auto-analysis
+7. Find the exported JNI function (`Java_..._bar`)
+8. Locate the `strncmp` call in the decompiled pseudo-code
+9. Extract and decode the reference string
+10. Validate in the app
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| JADX does not show the right class quickly | Use global search for `MainActivity`, `CodeCheck`, or `loadLibrary` |
+| Ghidra shows too many functions | Filter the Symbol Tree with `Java_` or `CodeCheck_bar` |
+| The value found looks unreadable | Check if it is hex ASCII — convert with `bytes.fromhex()` |
+| Decoded string still looks wrong | Try reversing it with `s[::-1]` |
+| App still rejects the answer | Check exact capitalization, spaces, and spelling |
+
+---
+
+## Conclusion
+
+UnCrackable Level 2 demonstrates a classic technique in Android obfuscation: moving the critical validation from readable Java bytecode into a compiled native library. The Java layer only delegates — the actual secret never appears in any `.class` or `.dex` file. By following the data flow from `MainActivity` through `CodeCheck` into `libfoo.so`, and using Ghidra to decompile the JNI function, the `strncmp` comparison reveals a reversed hex-encoded string that decodes to `Thanks for all the fish`.
