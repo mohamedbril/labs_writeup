@@ -1,0 +1,84 @@
+## 1. Introduction et Objectifs du TP
+
+L'objectif de ce laboratoire est de mettre en place un environnement local et isolé afin de réaliser l'**analyse dynamique (runtime)** d'une application Android vulnérable nommée **DIVA** (*Damn Insecure and Vulnerable App*). Pour ce faire, j'ai orchestré l'interconnexion entre un émulateur rooté et le framework d'analyse automatisé **MobSF** (Mobile Security Framework) déployé via Docker.
+
+L'intérêt principal de cette manipulation est d'observer le comportement de l'application en cours d'exécution : intercepter son trafic réseau chiffré, auditer les modifications de son système de fichiers à la volée, et analyser ses interactions avec le système d'exploitation via les logs d'exécution (Logcat) et l'instrumentation de code avec **Frida**.
+
+---
+
+## 2. Architecture de l'Environnement de Test
+
+Pour obtenir une analyse propre et éviter les faux positifs, j'ai configuré un environnement spécifique basé sur deux composants clés :
+
+### Émulateur Android (AVD) "Pure Android"
+Lors de la création de l'Android Virtual Device via Android Studio, j'ai volontairement sélectionné une image système **sans les Google Play Services** (Image Android pure en **API 30, architecture x86_64**). 
+* **Pourquoi ce choix ?** Les services Google par défaut génèrent un bruit de fond constant (télémétrie, requêtes Firebase, vérifications de mise à jour) qui pollue les captures réseau et les logs système. De plus, les images "Non-Production" (sans Play Store) facilitent l'accès `root`, indispensable pour que MobSF puisse injecter son serveur Frida.
+* *Note sur la version :* J'ai limité l'environnement à l'API 30 car sur les versions supérieures, la partition `/system` n'est plus accessible en écriture par défaut, ce qui bloque le déploiement automatique des certificats CA par MobSF.
+
+### Déploiement de MobSF
+MobSF a été instancié via Docker. L'utilisation du conteneur permet de centraliser les outils de décompilation, le serveur de proxying et l'interface de contrôle sans surcharger le système hôte.
+
+---
+
+## 3. Déroulement des Manipulations & Configuration
+
+### Étape 1 : Initialisation de l'AVD
+J'ai configuré un profil de smartphone (Pixel 5, API 30) dans le Device Manager d'Android Studio. Pour le lancer avec les privilèges d'écriture nécessaires à l'analyse, j'ai utilisé le script d'automatisation officiel récupéré depuis le dépôt Git de MobSF :
+
+```bash
+git clone [https://github.com/MobSF/Mobile-Security-Framework-MobSF.git](https://github.com/MobSF/Mobile-Security-Framework-MobSF.git)
+cd Mobile-Security-Framework-MobSF
+./scripts/start_avd.sh MobSF_DIVA_API_30
+Une fois le boot terminé, j'ai vérifié la bonne détection du périphérique via ADB :
+
+Bash
+$ adb devices
+List of devices attached
+emulator-5554	device
+Étape 2 : Lancement du scanner MobSF
+Avec l'identifiant emulator-5554 récupéré, j'ai instancié le conteneur Docker en liant la variable d'environnement correspondante pour que MobSF s'y connecte automatiquement :
+
+Bash
+docker run -it --rm \
+  -p 8000:8000 \
+  -e MOBSF_ANALYZER_IDENTIFIER=emulator-5554 \
+  opensecurity/mobile-security-framework-mobsf:latest
+L'interface est devenue accessible sur http://127.0.0.1:8000.
+
+Étape 3 : Analyse de l'application DIVA
+J'ai soumis le fichier diva-beta.apk sur la plateforme pour lancer l'analyse statique initiale.
+
+Une fois la phase de décompilation terminée, j'ai cliqué sur Start Dynamic Analyzer.
+
+MobSF a alors automatiquement poussé l'application sur mon émulateur, démarré frida-server en tâche de fond sur le smartphone virtuel, et configuré les règles de routage pour le proxy HTTP(S).
+
+4. Résultats des Tests et Analyse des Vulnérabilités Détectées
+En manipulant l'application DIVA directement depuis l'écran de l'émulateur, j'ai pu identifier et valider plusieurs vulnérabilités critiques via le panneau de contrôle de MobSF :
+
+A. Insecure Data Storage (Stockage de données non sécurisé)
+Manipulation : Dans le challenge dédié de l'application, j'ai saisi des identifiants de test (un mot de passe utilisateur).
+
+Constat au Runtime : En utilisant le File Monitor et l'exploration des répertoires de MobSF, j'ai inspecté l'espace de stockage privé de l'application (/data/data/jakhar.aseem.diva/). Les données sensibles ont été écrites en clair dans un fichier de préférences XML (SharedPrefs) et dans une base de données SQLite locale, sans aucun mécanisme de chiffrement. Un attaquant ayant un accès physique ou un malware exploitant une élévation de privilèges pourrait facilement exfiltrer ces secrets.
+
+B. Insecure Logging (Fuites d'informations via les logs)
+Manipulation : Saisie de données de carte bancaire dans le formulaire de l'application.
+
+Constat au Runtime : Via l'onglet Logcat Stream de MobSF, j'ai vu apparaître les chaînes de caractères saisies textuellement au milieu des logs de debug de l'application. Les fonctions de journalisation (Log.d, Log.e) n'ont pas été nettoyées avant la compilation de la version de production.
+
+C. Access Control Issues & Exploitation d'Intents
+Manipulation : Utilisation de l'outil Exported Activity Tester de MobSF.
+
+Constat au Runtime : MobSF a mis en évidence que certaines activités internes de DIVA possèdent le flag android:exported="true" dans le fichier AndroidManifest.xml, sans être protégées par des permissions spécifiques. J'ai pu forcer l'affichage d'écrans normalement restreints (contenant des données privées) depuis l'interface de MobSF sans passer par l'écran de connexion légitime de l'application.
+
+5. Synthèse des Outils du Panneau de Contrôle MobSF
+Pour mener à bien ce write-up, j'ai dressé une cartographie des fonctionnalités clés offertes par l'interface dynamique de MobSF qui m'ont permis de réaliser ces constats :
+
+Logcat Stream : Indispensable pour intercepter en direct les fuites de variables, les messages d'erreur et les données sensibles envoyées par l'application au runtime.
+
+TLS/SSL Security Tester : M'a permis de valider si l'application appliquait correctement le SSL Pinning. Dans le cas de DIVA, l'absence de protection stricte permet au proxy de MobSF de lire l'intégralité du trafic réseau HTTPS en clair.
+
+Frida (Spawn & Inject) : Permet d'injecter des scripts d'instrumentation pour inspecter la mémoire de la machine virtuelle Java (Dalvik/ART) et intercepter les valeurs de retour de fonctions sensibles (ex: bypass de contrôles locaux).
+
+Exported Activity Tester : Automatise l'envoi d'Intents malveillants pour tester les failles de contrôle d'accès sur les composants exposés de l'application.
+
+Generate Report : Permet de consolider l'ensemble des preuves accumulées (captures d'écran, logs collectés, modifications de fichiers) sous un format standardisé.
