@@ -1,0 +1,91 @@
+## 1. Introduction et Avertissement Éthique
+
+L'objectif de ce laboratoire est de configurer un environnement d'audit réseau capable de lire le trafic HTTPS d'une application Android qui implémente des mécanismes de **SSL Pinning** (épinglage de certificats). Pour contourner ces protections, j'ai utilisé **Objection**, une boîte à outils d'exploration mobile propulsée par le framework d'instrumentation dynamique **Frida**.
+
+---
+
+## 2. Phase 1 : Préparation de l'Environnement Hôte (PC)
+
+La première étape a consisté à installer les outils d'instrumentation sur ma machine d'analyse. J'ai privilégié l'utilisation de `pipx` pour isoler l'environnement Python d'Objection et éviter les conflits de dépendances.
+
+```bash
+# Installation de pipx si nécessaire
+python -m pip install --user pipx
+python -m pipx ensurepath
+
+# Installation d'Objection et des outils Frida
+pipx install objection
+pip install --upgrade frida frida-tools
+
+# Vérification des versions (crucial pour l'alignement avec le serveur)
+objection --version
+frida --version
+3. Phase 2 : Déploiement de Frida-Server sur l'Appareil
+Afin qu'Objection puisse interagir avec la mémoire de l'application cible, un agent (frida-server) doit tourner avec des privilèges élevés sur l'appareil Android (rooté ou émulateur).
+
+Bash
+# 1. Vérification de la connexion ADB et identification de l'architecture CPU
+adb devices
+adb shell getprop ro.product.cpu.abi
+# Résultat typique sur émulateur : x86_64 ou x86
+
+# 2. Après avoir téléchargé la version exacte de frida-server correspondant à la version de mon client (ex: 16.x.x), je l'ai poussée sur l'appareil
+adb push frida-server /data/local/tmp/
+
+# 3. Attribution des droits d'exécution
+adb shell chmod 755 /data/local/tmp/frida-server
+
+# 4. Lancement du serveur en tâche de fond (écoute sur toutes les interfaces locales)
+adb shell "/data/local/tmp/frida-server -l 0.0.0.0" &
+
+# 5. Validation de la communication avec le client Frida
+frida-ps -Uai
+Le flag -Uai permet de lister les applications installées via USB, validant ainsi que le pont d'instrumentation est opérationnel.
+
+4. Phase 3 : Routage Proxy et Installation du Certificat CA
+Même si le SSL Pinning est désactivé, l'application doit toujours valider la chaîne de confiance standard d'Android. J'ai donc dû coupler Objection avec Burp Suite.
+
+Configuration du Proxy : J'ai configuré le Wi-Fi de l'émulateur pour pointer vers l'adresse IP de ma machine hôte (ex: 192.168.56.1:8080).
+
+Installation de l'Autorité (CA) : J'ai téléchargé le certificat racine de Burp (depuis http://burp) et je l'ai installé dans le magasin des certificats de confiance de l'utilisateur sous Android.
+
+Note d'analyse : Si l'application utilise une Network Security Config très stricte qui ignore les certificats utilisateurs, l'étape suivante avec Objection s'occupera de neutraliser cette restriction logicielle en modifiant le comportement des TrustManagers.
+
+5. Phase 4 : Désactivation du SSL Pinning via Objection
+C'est ici qu'intervient la manipulation dynamique. J'ai identifié le nom du package de l'application cible, puis j'ai utilisé Objection pour la lancer en injectant la commande de contournement des vérifications SSL.
+
+Deux approches ont été testées :
+
+Méthode A : Injection au démarrage (Spawn) - Recommandée
+Cette méthode est idéale car elle neutralise les contrôles SSL avant même que l'application n'effectue sa première requête réseau de vérification.
+
+Bash
+# Lancement de l'application avec injection automatique du hook
+objection -g com.example.app explore --startup-command "android sslpinning disable"
+Méthode B : Attachement à chaud (Attach) - Alternative
+Si l'application crashe au démarrage à cause de mécanismes anti-tampering précoces, la technique consiste à lancer l'application normalement, puis à s'y attacher.
+
+Bash
+# 1. Ouvrir l'application sur le téléphone manuellement, puis :
+objection -g com.example.app explore
+
+# 2. Une fois le prompt Objection ouvert (com.example.app on (android: ...)), exécuter :
+android sslpinning disable
+Résultat observé : La console d'Objection a affiché une série de logs indiquant que les classes cryptographiques (notamment OkHttp3, TrustManagerImpl, HttpsURLConnection) ont été "hookées" avec succès. L'application a instantanément cessé de rejeter le certificat de Burp Suite.
+
+6. Validation et Dépannage (Troubleshooting)
+En naviguant dans les menus de l'application (ex: page de login), j'ai pu observer le trafic HTTPS apparaître en clair dans l'onglet HTTP history de Burp Suite, avec l'intégralité des en-têtes et du corps JSON des requêtes.
+
+Résolution de cas particuliers rencontrés :
+Application utilisant Cronet ou du Pinning natif (BoringSSL) : Objection cible principalement les couches Java. Si le trafic ne remonte toujours pas, c'est que l'application utilise une pile réseau C/C++ compilée. Dans de tels cas, il faut combiner Objection avec des scripts Frida personnalisés ciblant spécifiquement SSL_get_verify_result.
+
+Crashs aléatoires d'Objection : Pour éviter la surcharge lors de l'analyse, je me suis assuré de n'injecter qu'une seule commande --startup-command à la fois et de désactiver toute autre forme d'instrumentation superflue.
+
+7. Clôture et Hygiène du Laboratoire
+Afin de préserver la stabilité de l'environnement de test pour les futures analyses, j'ai procédé à un nettoyage complet :
+
+J'ai quitté le shell d'Objection (commande exit).
+
+J'ai tué le processus frida-server tournant sur l'appareil Android (adb shell killall frida-server).
+
+J'ai retiré les configurations manuelles du proxy Wi-Fi sur l'émulateur et supprimé le certificat CA de Burp Suite du magasin d'identifiants Android.
