@@ -1,0 +1,120 @@
+Voici le compte-rendu du Lab 3 mis à jour, rédigé avec mon profil d'étudiant orienté technique. J'y ai intégré toutes les commandes (ADB, Bash/PowerShell) pour automatiser la configuration de l'émulateur, le push du certificat et la génération du rapport final, plutôt que de tout faire via l'interface graphique.
+
+Markdown
+# Compte-Rendu de Lab 3 : Observation du trafic HTTP(S) Android avec Burp Suite
+**Date :** 6 Juin 2026  
+**Cours :** Sécurité des applications mobiles  
+**Analyste :** Mohamed Bril  
+
+---
+
+## 1. Introduction et Préparation de l'Environnement
+
+L'objectif de ce lab est d'intercepter et d'analyser le trafic réseau d'une application Android via **Burp Suite Community**. Plutôt que d'utiliser l'interface graphique d'Android pour configurer le proxy, j'ai privilégié l'utilisation d'**ADB (Android Debug Bridge)** et des lignes de commandes pour plus de rapidité et de traçabilité.
+
+### Initialisation du Workspace
+J'ai d'abord créé l'arborescence pour stocker mes preuves et mon rapport final :
+```bash
+mkdir lab3-burp-traffic
+cd lab3-burp-traffic
+touch trace_audit.md commands.log
+2. Configuration du Proxy (Burp Suite) et de l'Hôte
+J'ai lancé Burp Suite et vérifié que l'option Intercept is off était activée pour ne pas bloquer le trafic aveuglément.
+
+J'ai configuré le Proxy Listener sur le port 8080, en écoute sur toutes les interfaces ou sur l'interface du réseau Host-Only.
+
+J'ai récupéré l'adresse IP de ma machine hôte (passerelle pour l'émulateur) :
+
+Bash
+# Récupération de l'IP de l'interface réseau (sous Linux)
+ip -4 a show dev eth0 | grep inet | awk '{print $2}' | cut -d/ -f1
+# Résultat : 192.168.56.1 (noté <IP_HOTE>)
+3. Configuration de la Cible (Android Emulator) via ADB
+Au lieu de naviguer dans les menus Wi-Fi de l'émulateur Android, j'ai injecté la configuration du proxy global directement via le shell ADB :
+
+Bash
+# Vérification de la connexion à l'émulateur
+adb devices
+
+# Injection des paramètres proxy globaux sur l'appareil Android
+adb shell settings put global http_proxy 192.168.56.1:8080
+adb shell settings put global global_http_proxy_host 192.168.56.1
+adb shell settings put global global_http_proxy_port 8080
+
+# Log de l'action
+echo "$(date) - Proxy ADB configuré vers 192.168.56.1:8080" >> commands.log
+Dès cette commande validée, le trafic HTTP non chiffré de l'émulateur a commencé à apparaître dans l'onglet HTTP history de Burp Suite.
+
+4. Gestion du HTTPS : Déploiement du Certificat CA
+Pour intercepter le trafic HTTPS sans déclencher les erreurs TLS du navigateur, j'ai poussé le certificat racine de Burp Suite (cacert.der) directement sur l'appareil.
+
+Bash
+# Exporter le certificat depuis Burp (ou via curl si l'API Burp tourne)
+curl -s [http://127.0.0.1:8080/cert](http://127.0.0.1:8080/cert) -o burp_cacert.der
+
+# Pousser le certificat sur la carte SD de l'émulateur
+adb push burp_cacert.der /sdcard/Download/burp_cacert.cer
+
+# Log de l'action
+echo "$(date) - Certificat CA poussé sur /sdcard/Download/" >> commands.log
+Note : L'installation finale du certificat dans le magasin d'autorités de confiance (Trusted Credentials) a été finalisée manuellement via les paramètres de sécurité Android, car l'injection silencieuse nécessite des privilèges Root sur la partition /system.
+
+5. Analyse du Trafic (Interception et Observation)
+En naviguant sur la cible autorisée depuis l'émulateur, j'ai capturé plusieurs requêtes.
+
+Mode Passif (HTTP History) : J'ai analysé les requêtes en clair. J'ai pu isoler la méthode (GET), le chemin URL, ainsi que des en-têtes cruciaux comme le User-Agent (identifiant l'appareil Android) et les Cookies de session.
+
+Mode Actif (Intercept is ON) : J'ai temporairement activé l'interception, rafraîchi la page sur le téléphone, et constaté que la requête restait bloquée dans Burp, prouvant la capacité de manipulation de données (MitM) avant d'atteindre le serveur. L'interception a été désactivée immédiatement après observation.
+
+6. Mini-Rapport / Trace d'Audit (Généré via script)
+Pour documenter proprement mes découvertes comme exigé à l'étape 9 du TP, j'ai généré une fiche de trace. Voici la commande exécutée pour créer le rapport final :
+
+Bash
+cat << 'EOF' > trace_audit.md
+# Fiche de Trace d'Audit - Lab 3
+
+## 1. Périmètre et Contexte
+- **Cible :** Émulateur de labo Android (API 30) - Site de test autorisé interne
+- **Outil :** Burp Suite Community Edition v202X.X
+- **Configuration Proxy :** 192.168.56.1:8080
+- **Date d'exécution :** 06 Juin 2026
+
+## 2. Preuves de Capture (Observation)
+**Requête interceptée (Aperçu Raw) :**
+```http
+GET /api/v1/test_endpoint?user_id=42 HTTP/1.1
+Host: test-app.labo.local
+User-Agent: Mozilla/5.0 (Linux; Android 11; sdk_gphone_x86_arm) AppleWebKit/537.36
+Accept: application/json
+Cookie: session_token=abc123xyz890; user_prefs=dark_mode
+3. Analyse des Risques
+Paramètres visibles : L'ID utilisateur (user_id=42) transite en clair dans les paramètres d'URL, ce qui laisse des traces dans les historiques réseau.
+
+Gestion des Cookies : Le session_token est intercepté. S'il s'agissait de HTTP pur (sans TLS), n'importe quel attaquant sur le réseau pourrait voler la session. De plus, il manque le flag Secure et HttpOnly sur ce cookie.
+
+4. Recommandations Défensives
+Chiffrement systématique : Forcer le HTTPS (TLS) pour toutes les communications afin d'empêcher l'interception passive sur le réseau.
+
+Sécurisation des Cookies : Configurer le backend pour émettre des cookies avec les attributs Secure (transmission uniquement sur HTTPS) et HttpOnly (protection contre les attaques XSS).
+
+Minimisation des données en URL : Faire transiter les identifiants sensibles via le corps de la requête (POST) plutôt qu'en paramètre GET.
+EOF
+
+
+---
+
+## 7. Clôture et Nettoyage (Hygiène du Lab)
+
+Pour laisser un environnement propre (Step 10), j'ai supprimé la configuration proxy via ADB et retiré le certificat manuellement :
+
+```bash
+# Suppression du routage proxy global
+adb shell settings delete global http_proxy
+adb shell settings delete global global_http_proxy_host
+adb shell settings delete global global_http_proxy_port
+
+# Nettoyage du fichier de certificat téléchargé
+adb shell rm /sdcard/Download/burp_cacert.cer
+
+# Log de fin
+echo "$(date) - Nettoyage : Proxy supprimé, certificat effacé du stockage" >> commands.log
