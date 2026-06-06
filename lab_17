@@ -1,0 +1,659 @@
+# LAB 17 — Cracker OWASP UnCrackable Android Level 3
+
+> **Course:** Sécurité des applications mobiles  
+> **Target:** OWASP UnCrackable Android Level 3  
+> **Goal:** Understand and bypass Android protections, analyze native code, and recover the secret code.
+
+---
+
+## 1. Lab Overview
+
+This lab focuses on the reverse engineering of a protected Android application: **OWASP UnCrackable Level 3**.
+
+The application combines several defensive mechanisms:
+
+- Root detection
+- APK integrity verification
+- Debuggable flag detection
+- Anti-debugging logic
+- Anti-Frida / instrumentation detection
+- Java-to-native validation using JNI
+- Native code obfuscation
+- Encoded secret verification
+
+The objective is not only to find the secret, but also to understand how the application protects itself and how each protection can be analyzed and bypassed in a controlled lab environment.
+
+---
+
+## 2. Learning Objectives
+
+By the end of this lab, you should be able to:
+
+- Decompile an Android APK with **JADX** and **apktool**.
+- Read and patch **smali** code.
+- Identify root detection and integrity-checking logic.
+- Rebuild, sign, and reinstall a patched APK.
+- Analyze a native `.so` library with **Ghidra**.
+- Recognize native anti-debug and anti-Frida checks.
+- Understand JNI function mapping between Java and native code.
+- Separate useful validation logic from obfuscation noise.
+- Recover a secret using byte-level XOR decoding.
+
+---
+
+## 3. Required Tools
+
+Install the following tools before starting:
+
+| Tool | Usage |
+|---|---|
+| Android Studio | Create and run an Android emulator |
+| adb | Install, uninstall, and interact with the APK |
+| JADX-GUI | Java-level static analysis |
+| apktool | Decode and rebuild the APK |
+| apksigner | Sign the rebuilt APK |
+| Ghidra | Analyze native libraries |
+| Python 3 | Decode the recovered secret |
+
+Recommended emulator:
+
+- Android API 30 or newer
+- ARM64 or x86_64 architecture
+
+To check the emulator ABI:
+
+```bash
+adb shell getprop ro.product.cpu.abi
+```
+
+---
+
+## 4. Download and Install the Original APK
+
+Download the challenge APK:
+
+```bash
+wget https://github.com/OWASP/owasp-mstg/raw/master/Crackmes/Android/Level_03/UnCrackable-Level3.apk
+```
+
+Install it on the emulator:
+
+```bash
+adb install UnCrackable-Level3.apk
+```
+
+When opening the application, you should see a field asking for a **24-character secret code**.
+
+On a rooted, debug-enabled, or modified environment, the application may show an error such as:
+
+```text
+Rooting or tampering detected.
+```
+
+This is the first protection we need to understand and bypass.
+
+---
+
+## 5. Step 1 — Static Analysis with JADX
+
+Open the APK using **JADX-GUI**.
+
+Look for the package:
+
+```text
+sg.vantagepoint.uncrackable3
+```
+
+Then open:
+
+```text
+MainActivity
+```
+
+Important observations:
+
+### `System.loadLibrary("foo")`
+
+The application loads a native library:
+
+```java
+System.loadLibrary("foo");
+```
+
+This means important logic is implemented in native code inside `libfoo.so`.
+
+### `verifyLibs()`
+
+The method `verifyLibs()` checks the integrity of the application and native libraries. If the APK or library is modified, a static variable named `tampered` is set.
+
+### `onCreate()`
+
+The `onCreate()` method performs several checks:
+
+- `checkRoot1()`
+- `checkRoot2()`
+- `checkRoot3()`
+- `IntegrityCheck.isDebuggable()`
+- `tampered` value
+
+If one of these checks fails, the app calls:
+
+```java
+showDialog("Rooting or tampering detected.");
+```
+
+This confirms that the first bypass can be done by patching the Java/smali layer.
+
+---
+
+## 6. Step 2 — Decode the APK with apktool
+
+Decode the APK:
+
+```bash
+apktool d UnCrackable-Level3.apk -o uncrackable3
+```
+
+After decoding, the important folders are:
+
+```text
+uncrackable3/
+├── smali/
+├── lib/
+│   ├── arm64-v8a/
+│   ├── armeabi-v7a/
+│   └── x86_64/
+└── AndroidManifest.xml
+```
+
+The smali code is what we will patch before rebuilding the application.
+
+---
+
+## 7. Step 3 — Patch Root and Tamper Detection in smali
+
+Open the following file:
+
+```text
+uncrackable3/smali/sg/vantagepoint/uncrackable3/MainActivity.smali
+```
+
+Verify that the first line looks like this:
+
+```smali
+.class public Lsg/vantagepoint/uncrackable3/MainActivity;
+```
+
+Search for:
+
+```text
+showDialog
+```
+
+You should find the call inside `onCreate()`.
+
+The important block looks like this:
+
+```smali
+invoke-static {}, Lsg/vantagepoint/util/RootDetection;->checkRoot1()Z
+move-result v0
+if-nez v0, :cond_0
+
+invoke-static {}, Lsg/vantagepoint/util/RootDetection;->checkRoot2()Z
+move-result v0
+if-nez v0, :cond_0
+
+invoke-static {}, Lsg/vantagepoint/util/RootDetection;->checkRoot3()Z
+move-result v0
+if-nez v0, :cond_0
+
+invoke-virtual {p0}, Lsg/vantagepoint/uncrackable3/MainActivity;->getApplicationContext()Landroid/content/Context;
+move-result-object v0
+invoke-static {v0}, Lsg/vantagepoint/util/IntegrityCheck;->isDebuggable(Landroid/content/Context;)Z
+move-result v0
+if-nez v0, :cond_0
+
+sget v0, Lsg/vantagepoint/uncrackable3/MainActivity;->tampered:I
+if-eqz v0, :cond_1
+
+:cond_0
+const-string v0, "Rooting or tampering detected."
+invoke-direct {p0, v0}, Lsg/vantagepoint/uncrackable3/MainActivity;->showDialog(Ljava/lang/String;)V
+
+:cond_1
+new-instance v0, Lsg/vantagepoint/uncrackable3/CodeCheck;
+```
+
+### Patch Option A — Skip the Error Dialog
+
+Replace this part:
+
+```smali
+:cond_0
+const-string v0, "Rooting or tampering detected."
+invoke-direct {p0, v0}, Lsg/vantagepoint/uncrackable3/MainActivity;->showDialog(Ljava/lang/String;)V
+```
+
+With:
+
+```smali
+:cond_0
+goto :cond_1
+```
+
+This forces the application to continue normally even if root or tampering is detected.
+
+### Patch Option B — Disable `showDialog()` Completely
+
+Find the method:
+
+```smali
+.method private showDialog(Ljava/lang/String;)V
+```
+
+Replace its content with:
+
+```smali
+.method private showDialog(Ljava/lang/String;)V
+    .locals 0
+    return-void
+.end method
+```
+
+This makes every call to `showDialog()` do nothing.
+
+---
+
+## 8. Step 4 — Rebuild, Sign, and Install the Patched APK
+
+Rebuild the APK:
+
+```bash
+apktool b uncrackable3 -o UnCrackable-Level3-patched.apk
+```
+
+Sign it on Linux/macOS:
+
+```bash
+apksigner sign --ks ~/.android/debug.keystore UnCrackable-Level3-patched.apk
+```
+
+Sign it on Windows:
+
+```cmd
+apksigner sign --ks "%USERPROFILE%\.android\debug.keystore" UnCrackable-Level3-patched.apk
+```
+
+Default debug keystore password:
+
+```text
+android
+```
+
+Uninstall the original app if needed:
+
+```bash
+adb uninstall owasp.mstg.uncrackable3
+```
+
+Install the patched APK:
+
+```bash
+adb install -r UnCrackable-Level3-patched.apk
+```
+
+Expected result:
+
+- The application opens normally.
+- No root/tamper popup appears.
+- You can enter text in the secret field.
+
+At this point, the Java/smali protection is bypassed.
+
+---
+
+## 9. Step 5 — Analyze the Native Library with Ghidra
+
+The application loads the native library:
+
+```text
+libfoo.so
+```
+
+Depending on your emulator architecture, use the matching library:
+
+```text
+uncrackable3/lib/arm64-v8a/libfoo.so
+uncrackable3/lib/x86_64/libfoo.so
+```
+
+Open `libfoo.so` in **Ghidra**:
+
+1. Create a new project.
+2. Import `libfoo.so`.
+3. Run auto-analysis.
+4. Open the CodeBrowser.
+
+---
+
+## 10. Step 6 — Patch Anti-Debug and Anti-Frida Logic
+
+In Ghidra, look for the initialization function executed when the native library loads.
+
+In the lab, this function is identified as:
+
+```text
+sub_73D0
+```
+
+This function performs checks such as:
+
+- Reading `/proc/self/maps`
+- Searching for strings like `frida` or `xposed`
+- Calling `ptrace()` to block debugging
+- Calling a crash/exit function if instrumentation is detected
+
+### Native Patch
+
+Patch the first instruction of the function to immediately return.
+
+For ARM64:
+
+```asm
+RET
+```
+
+In Ghidra:
+
+1. Go to the first instruction of the function.
+2. Right click or use `Edit -> Patch Instruction`.
+3. Replace the instruction with:
+
+```asm
+RET
+```
+
+Export the patched library with the same name:
+
+```text
+libfoo.so
+```
+
+Then copy it back into the decoded APK directory, replacing the original library:
+
+```bash
+cp libfoo.so uncrackable3/lib/arm64-v8a/libfoo.so
+```
+
+Or, for x86_64:
+
+```bash
+cp libfoo.so uncrackable3/lib/x86_64/libfoo.so
+```
+
+Rebuild, sign, and reinstall the APK again:
+
+```bash
+apktool b uncrackable3 -o UnCrackable-Level3-patched.apk
+apksigner sign --ks ~/.android/debug.keystore UnCrackable-Level3-patched.apk
+adb install -r UnCrackable-Level3-patched.apk
+```
+
+Now the app should not crash because of anti-debug or anti-Frida native checks.
+
+---
+
+## 11. Step 7 — Find the Native Check Function
+
+Return to JADX and inspect the verification flow.
+
+Inside `MainActivity.verify(View view)`, the user input is passed to:
+
+```java
+this.check.check_code(string)
+```
+
+The important point is that `check_code()` is not implemented fully in Java. It calls native code through JNI.
+
+In Ghidra, search for the JNI symbol:
+
+```text
+Java_sg_vantagepoint_uncrackable3_CodeCheck_check_1code
+```
+
+Open this function and follow the call to the main native validation logic.
+
+In the lab, this leads to a function similar to:
+
+```text
+FUN_001012c0
+```
+
+This function contains a large amount of repeated and confusing code.
+
+---
+
+## 12. Step 8 — Identify the Obfuscation Noise
+
+Inside the native function, you will see repeated patterns such as:
+
+- Many `malloc(0x10)` calls
+- Linked-list construction
+- Repeated arithmetic operations
+- LCG-like operations using constants such as:
+
+```text
+0x41c64e6d
+0x3039
+```
+
+This is mostly obfuscation.
+
+The goal is not to understand every repeated block line by line. Instead, focus on the data that is finally written and later compared against the user input.
+
+Useful reverse engineering rule:
+
+> In heavily obfuscated functions, follow the data flow instead of reading the pseudo-code linearly.
+
+---
+
+## 13. Step 9 — Extract the Encoded Secret
+
+Near the end of the native logic, three constants are written to a local buffer.
+
+The useful 24 bytes are:
+
+```text
+1d 08 11 13 0f 17 49 15 0d 00 03 19 5a 1d 13 15 08 0e 5a 00 17 08 13 14
+```
+
+In hex form:
+
+```text
+1d0811130f1749150d0003195a1d1315080e5a0017081314
+```
+
+Ghidra may display these values as large integers. Because the architecture stores values in **little-endian**, the bytes in memory appear reversed compared to the integer representation.
+
+For example, if Ghidra shows:
+
+```text
+0x1549170f1311081d
+```
+
+The actual byte order in memory is:
+
+```text
+1d 08 11 13 0f 17 49 15
+```
+
+This confirms that the final byte buffer must be read in memory order.
+
+---
+
+## 14. Step 10 — Understand the XOR Validation
+
+The native code compares the user input against a decoded reference value.
+
+The comparison logic is equivalent to:
+
+```text
+user_input[i] == encoded[i] XOR xor_key[i]
+```
+
+The XOR key used in this challenge is:
+
+```text
+pizzapizzapizzapizzapizzapizza
+```
+
+Only the first 24 bytes are needed because the encoded secret is 24 bytes long.
+
+---
+
+## 15. Step 11 — Decode the Secret with Python
+
+Create a file named:
+
+```text
+decode_key.py
+```
+
+Add the following code:
+
+```python
+encoded = bytes.fromhex("1d0811130f1749150d0003195a1d1315080e5a0017081314")
+xor_key = b"pizzapizzapizzapizzapizzapizza"
+
+secret = bytes(a ^ b for a, b in zip(encoded, xor_key))
+print("Secret found:", secret.decode())
+```
+
+Run it:
+
+```bash
+python3 decode_key.py
+```
+
+Expected output:
+
+```text
+Secret found: making owasp great again
+```
+
+---
+
+## 16. Final Secret
+
+The correct secret code is:
+
+```text
+making owasp great again
+```
+
+Enter this value into the patched application.
+
+Expected result:
+
+```text
+Success!
+```
+
+---
+
+## 17. Complete Solve Summary
+
+The full solving process is:
+
+1. Open the APK in JADX.
+2. Identify root, integrity, debug, and tamper checks in `MainActivity`.
+3. Decode the APK with apktool.
+4. Patch `MainActivity.smali` to skip the root/tamper dialog.
+5. Rebuild and sign the APK.
+6. Install the patched APK.
+7. Open `libfoo.so` in Ghidra.
+8. Identify the native anti-debug / anti-Frida initialization function.
+9. Patch it to return immediately.
+10. Export the patched `.so` file.
+11. Rebuild, sign, and reinstall the APK again.
+12. Analyze the JNI function for `check_code()`.
+13. Ignore the obfuscation noise and focus on the final byte buffer.
+14. Extract the 24 encoded bytes.
+15. XOR the bytes with the key `pizza...`.
+16. Recover the secret: `making owasp great again`.
+17. Submit the secret in the app and verify success.
+
+---
+
+## 18. Key Takeaways
+
+- Android apps can move sensitive logic from Java to native code to make reverse engineering harder.
+- Root detection and integrity checks are often visible in Java or smali.
+- Smali patching can bypass UI-level blocking logic.
+- Native libraries may execute anti-debug logic before the app reaches the main validation code.
+- Ghidra is enough to analyze and patch many native Android challenges.
+- Obfuscation often creates a lot of useless code to hide a small amount of important logic.
+- Following the data flow is more effective than reading every line of pseudo-code.
+- XOR-based secret encoding is easy to reverse once both the encoded data and key are identified.
+
+---
+
+## 19. Troubleshooting
+
+### `INSTALL_FAILED_UPDATE_INCOMPATIBLE`
+
+Uninstall the original app first:
+
+```bash
+adb uninstall owasp.mstg.uncrackable3
+adb install UnCrackable-Level3-patched.apk
+```
+
+### `apksigner` cannot find the keystore
+
+On Linux/macOS, use:
+
+```bash
+~/.android/debug.keystore
+```
+
+On Windows, use:
+
+```cmd
+%USERPROFILE%\.android\debug.keystore
+```
+
+### The app still crashes after patching smali
+
+The crash may come from native anti-debug or anti-Frida checks. Patch the native initialization function in `libfoo.so` to return immediately.
+
+### The native library patch does not work
+
+Make sure you patched the correct ABI folder. Check the emulator ABI:
+
+```bash
+adb shell getprop ro.product.cpu.abi
+```
+
+Then replace the matching library in:
+
+```text
+uncrackable3/lib/<ABI>/libfoo.so
+```
+
+---
+
+## 20. Reflection Questions
+
+1. Why does the app move the password check into native code?
+2. What is the purpose of checking `/proc/self/maps`?
+3. Why does the app use root and tamper detection before showing the main interface?
+4. Why is the repeated `malloc()` and linked-list code considered obfuscation?
+5. How does little-endian representation affect the extraction of constants from Ghidra?
+6. How could a developer make the secret harder to recover?
+
+---
+
+## 21. Disclaimer
+
+This write-up is for educational use in a controlled reverse engineering lab. The techniques shown here should only be applied to applications you own, applications you are authorized to test, or public crackmes designed for learning.
