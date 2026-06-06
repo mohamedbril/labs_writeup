@@ -1,0 +1,139 @@
+# Compte-Rendu de Lab 10 : Guide d'installation et d'instrumentation avec Frida
+**Cours :** Sécurité des applications mobiles  
+**Analyste :** Mohamed Bril  
+
+---
+
+## 1. Introduction et Objectifs du Laboratoire
+
+Ce laboratoire a pour objectif de configurer un environnement complet d'instrumentation dynamique en utilisant **Frida**. L'instrumentation dynamique permet d'injecter du code (JavaScript) dans un processus en cours d'exécution afin de modifier son comportement, d'intercepter des appels de fonctions (natives ou Java) et d'analyser les données en mémoire. 
+
+Mes objectifs pour cette session étaient les suivants :
+* Installer le client Frida (`frida-tools`) sur la machine hôte.
+* Déployer l'agent `frida-server` sur un appareil Android via ADB.
+* Valider la communication entre l'hôte et la cible.
+* Injecter des scripts basiques (Java et natifs) et explorer la console interactive.
+* Simuler et résoudre un problème de connexion (Troubleshooting).
+
+---
+
+## 2. Phase 1 : Installation du Client (Machine Hôte)
+
+La première étape a consisté à préparer mon environnement Python local pour interagir avec le serveur Frida. J'ai utilisé `pip` pour installer les paquets nécessaires.
+
+```bash
+# Mise à jour et installation des outils Frida
+python -m pip install --upgrade frida frida-tools
+
+# Validation de l'installation (Livrable 1)
+frida --version
+# Résultat : 16.x.x
+
+python -c "import frida; print(frida.__version__)"
+# Résultat : 16.x.x
+3. Phase 2 : Déploiement de Frida-Server (Cible Android)
+Pour que Frida puisse manipuler les processus sur l'appareil Android (un émulateur rooté dans ce contexte), un agent serveur doit être exécuté avec des privilèges élevés.
+
+Identification de l'architecture et téléchargement
+Avant de transférer le serveur, j'ai vérifié l'architecture du processeur de mon émulateur pour télécharger la version correspondante exacte (la version du serveur doit correspondre rigoureusement à la version du client 16.x.x) :
+
+Bash
+adb shell getprop ro.product.cpu.abi
+# Résultat obtenu : x86_64
+J'ai ensuite téléchargé et décompressé l'archive frida-server-16.x.x-android-x86_64.xz.
+
+Transfert et Exécution (Livrable 2)
+J'ai poussé le binaire sur l'appareil dans un répertoire temporaire accessible en exécution, attribué les bons droits, puis je l'ai lancé en tâche de fond.
+
+Bash
+# Transfert du binaire
+adb push frida-server /data/local/tmp/
+
+# Attribution des droits d'exécution
+adb shell chmod 755 /data/local/tmp/frida-server
+
+# Lancement du serveur en arrière-plan
+adb shell "nohup /data/local/tmp/frida-server -l 0.0.0.0 >/dev/null 2>&1 &"
+
+# Redirection des ports pour assurer la communication
+adb forward tcp:27042 tcp:27042
+adb forward tcp:27043 tcp:27043
+Pour valider le déploiement, j'ai listé les processus des applications installées :
+
+Bash
+frida-ps -Uai
+# Affiche une liste des applications avec leur PID, confirmant la connexion USB/ADB.
+4. Phase 3 : Injection de Scripts et Exploration (Livrable 3)
+Injection d'un Script Java Minimal
+Pour confirmer le bon fonctionnement du moteur Java de Frida, j'ai créé un script hello.js :
+
+JavaScript
+Java.perform(function () {
+  console.log("[+] Frida Java.perform OK");
+});
+Exécution via l'interface CLI :
+
+Bash
+frida -U -f com.example.app1 -l hello.js
+# La console démarre, suspend l'application. Je tape '%resume' pour relancer.
+# Résultat : [+] Frida Java.perform OK s'affiche dans la console.
+Exploration Interactive et Hooks Natifs/Java
+Une fois attaché au processus, j'ai exploité la console interactive pour auditer les couches natives et Java de l'application :
+
+Analyse de l'environnement natif :
+
+JavaScript
+Process.arch // Vérification de l'architecture (x64)
+Process.enumerateModules().filter(m => m.name.indexOf("crypto") !== -1) // Recherche de librairies cryptographiques
+Hooking d'une fonction native (connect) :
+J'ai créé un script pour intercepter la fonction connect de la libc.so afin d'observer les requêtes réseau furtives.
+
+JavaScript
+const connectPtr = Process.getModuleByName("libc.so").getExportByName("connect");
+Interceptor.attach(connectPtr, {
+  onEnter(args) { console.log("[+] Tentative de connexion réseau (connect) interceptée !"); }
+});
+Hooking Java (SharedPreferences et SQLite) :
+J'ai injecté un script surveillant les écritures dans les SharedPreferences pour traquer la sauvegarde de jetons locaux, ainsi que la méthode execSQL de SQLiteDatabase pour auditer la structure locale.
+
+JavaScript
+var EditorImpl = Java.use("android.app.SharedPreferencesImpl$EditorImpl");
+EditorImpl.putString.overload("java.lang.String", "java.lang.String").implementation = function (key, value) {
+  console.log("[Prefs] Écriture -> Key: " + key + " | Value: " + value);
+  return this.putString(key, value);
+};
+5. Phase 4 : Dépannage / Troubleshooting (Livrable 4)
+Au cours de l'expérimentation, j'ai simulé une perte de connexion pour documenter ma démarche de diagnostic.
+
+Erreur rencontrée :
+Failed to enumerate processes: unable to connect to remote frida-server lors du lancement de frida-ps -U.
+
+Démarche de diagnostic et de résolution :
+
+Vérification de la connexion ADB :
+adb devices renvoyait bien l'état device, écartant un problème de câble ou d'autorisation RSA.
+
+Vérification du processus sur le système cible :
+adb shell ps | grep frida ne renvoyait aucun résultat. L'agent avait planté ou avait été fermé.
+
+Vérification de la compatibilité des versions :
+J'ai vérifié que la version installée via pip correspondait exactement au binaire téléchargé (un décalage majeur/mineur cause des instabilités de la liaison RPC).
+
+Correction :
+J'ai relancé le frida-server avec les droits adéquats sur l'appareil et ré-établi les redirections de port (adb forward tcp:27042 tcp:27042). La commande frida-ps -U a immédiatement refonctionné.
+
+6. Phase 5 : Clôture et Nettoyage (Hygiène)
+Pour clore le laboratoire et laisser un environnement Android propre, j'ai terminé l'exécution du serveur et supprimé les traces de mon passage :
+
+Bash
+# Arrêt brutal du processus frida-server
+adb shell pkill -f frida-server
+
+# Suppression du binaire de la mémoire persistante
+adb shell rm /data/local/tmp/frida-server
+
+# Vérification finale
+adb shell ps | grep frida
+# (Aucun retour, le système est propre).
+Conclusion
+Ce laboratoire m'a permis d'acquérir l'autonomie nécessaire pour déployer et utiliser Frida. Je suis désormais capable de m'attacher dynamiquement à un processus en cours d'exécution, d'inspecter ses accès mémoire, de contourner des sécurités par hooking (Java.perform / Interceptor), et de diagnostiquer d'éventuelles erreurs de déploiement client/serveur.
