@@ -1,0 +1,76 @@
+## 1. Introduction et Objectifs du TP
+
+L'objectif de ce laboratoire est de réaliser un audit défensif complet de la posture de sécurité d'une application mobile, sans aucune action intrusive ou tentative d'exploitation. La méthodologie repose sur la combinaison de deux approches complémentaires :
+* **Une analyse externe (OSINT) avec BeVigil** pour identifier les traces publiques, les endpoints exposés et les domaines associés.
+* **Une analyse statique interne avec Yaazhini** pour inspecter le code de l'APK à la recherche de secrets hardcodés, de configurations sensibles ou de permissions excessives.
+
+Ce travail met l'accent sur la traçabilité des actions, le triage rigoureux des faux positifs, et la corrélation des découvertes avec les standards de sécurité de l'industrie (OWASP MASVS).
+
+---
+
+## 2. Préparation du Périmètre et Traçabilité
+
+La première étape de cet audit a consisté à sécuriser mon environnement de travail et à définir un cadre strictement légal pour l'analyse.
+
+### Définition du Scope Légal
+J'ai rédigé un fichier `00-scope/scope.md` documentant explicitement l'autorisation de réaliser cette analyse sur l'APK pédagogique fourni par l'enseignant. J'y ai formellement exclu toute tentative de test intrusif ou de contournement de sécurité.
+
+### Initialisation du Workspace
+Pour assurer la reproductibilité de l'analyse, j'ai structuré mon espace de travail en plusieurs dossiers dédiés (`01-bevigil`, `02-yaazhini`, `03-triage`, `04-report`). 
+Afin de garantir l'intégrité de la cible, j'ai calculé l'empreinte cryptographique de l'APK :
+```powershell
+Get-FileHash -Path "00-scope\application_pedagogique.apk" -Algorithm SHA256
+J'ai consigné ce hash, ainsi que les versions exactes des outils utilisés, dans un fichier central analyse_info.txt. Enfin, j'ai activé un journal de bord (commands.log) pour y inscrire toutes les commandes PowerShell exécutées lors de l'audit.
+
+3. Phase de Collecte d'Informations
+A. Reconnaissance Externe avec BeVigil
+J'ai importé la cible dans la plateforme BeVigil (projet LAB-BEGINNER-20260606) pour cartographier son exposition publique. J'ai ensuite exporté les résultats au format JSON dans mon répertoire 01-bevigil et documenté mes observations dans bevigil_notes.md.
+
+Points d'intérêt identifiés publiquement :
+
+Domaines et Endpoints : J'ai relevé plusieurs sous-domaines (ex: serveurs d'API) et des chemins d'accès spécifiques en observant les requêtes réseau documentées par la plateforme.
+
+URLs non sécurisées : Identification de liens utilisant le protocole HTTP classique au lieu de HTTPS.
+
+Traces d'identifiants : Découverte d'adresses emails de développeurs laissées dans les métadonnées.
+
+Technologies obsolètes : L'outil a mis en évidence l'utilisation de bibliothèques tierces potentiellement vulnérables.
+
+B. Analyse Statique Interne avec Yaazhini
+J'ai ensuite décompilé et scanné l'APK localement à l'aide de Yaazhini. Cette étape m'a permis de chercher des failles directement dans le code source de l'application. J'ai consigné ces découvertes dans yaazhini_notes.md, en veillant à masquer rigoureusement (par la mention [MASQUÉ]) toutes les valeurs réelles des secrets trouvés.
+
+Points d'intérêt identifiés dans le code :
+
+Secrets Hardcodés : Découverte de clés d'API cloud inscrites en clair dans les fichiers XML et les classes Java.
+
+Endpoints cachés : Extraction d'URLs internes destinées aux environnements de développement et de staging.
+
+Configurations sensibles : J'ai repéré dans le fichier AndroidManifest.xml des flags dangereux, notamment android:allowBackup="true", permettant l'extraction de données applicatives via ADB.
+
+Composants exposés : Plusieurs activités (Activities) présentaient l'attribut exported="true" sans protection par permissions spécifiques.
+
+4. Normalisation, Triage et Corrélation OWASP
+Une fois les données collectées, il a fallu séparer le bruit des véritables failles de sécurité. J'ai croisé les rapports de BeVigil et Yaazhini pour construire un tableau de synthèse (03-triage/triage.csv).
+
+Dédoublonnage et Évaluation
+J'ai fusionné les alertes identiques remontées par les deux outils (par exemple, une URL HTTP vue par BeVigil et confirmée en dur dans le code par Yaazhini). Chaque constat unique a été doté d'un ID (ex: FIND-001), d'un niveau de confiance, et d'un score de sévérité (High, Medium, Low, Info). J'ai également identifié et écarté plusieurs faux positifs (ex: des variables nommées "password" qui n'étaient que des labels d'interface graphique).
+
+Mapping OWASP MASVS
+Pour donner un contexte normatif à ces vulnérabilités, j'ai créé un fichier owasp_mapping.md associant mes découvertes au standard Mobile Application Security Verification Standard (MASVS) :
+
+L'exposition de clés API a été catégorisée sous MASVS-STORAGE (Stockage de données).
+
+L'utilisation de communications HTTP non chiffrées a été reliée à MASVS-NETWORK (Communication réseau).
+
+Les composants mal isolés et les backups activés ont été liés à MASVS-PLATFORM (Interaction avec la plateforme).
+
+5. Synthèse des Résultats et Recommandations
+L'analyse combinée OSINT et statique démontre que l'application expose inutilement des informations critiques. La posture globale de sécurité est affaiblie par des pratiques de développement inadéquates, notamment le stockage de secrets côté client.
+
+Top 3 des actions correctives prioritaires :
+
+Sécuriser les communications : Forcer le chiffrement TLS (HTTPS) pour l'ensemble des flux réseau identifiés via la configuration réseau d'Android (networkSecurityConfig).
+
+Nettoyer le code source : Révoquer immédiatement les clés API exposées, les retirer du code, et implémenter un stockage chiffré via l'Android Keystore pour les futurs secrets.
+
+Renforcer le Manifeste Android : Désactiver les fonctionnalités de débogage et de sauvegarde (android:allowBackup="false") sur les versions de production, et implémenter des permissions strictes sur les composants exportés.
