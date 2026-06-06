@@ -1,0 +1,53 @@
+## 1. Introduction et Objectifs
+Ce premier laboratoire est consacré à la préparation d'un environnement d'analyse Android robuste, isolé et reproductible. L'objectif est de déployer la machine virtuelle **Mobexler**, de configurer un routage réseau adéquat (NAT pour l'accès Internet et Host-Only pour l'isolation de la cible), d'établir une ligne de base propre via un snapshot, et de valider la communication avec un périphérique Android via **ADB** (Android Debug Bridge).
+
+---
+
+## 2. Préparation et Import de l'Image Virtuelle
+Pour garantir l'intégrité de l'environnement de test avant même son déploiement, j'ai d'abord procédé au téléchargement de l'image au format `.ova`. Travaillant nativement sous environnement Linux, j'ai validé l'empreinte cryptographique du fichier avant l'importation afin de m'assurer que l'archive n'était ni corrompue ni altérée :
+
+```bash
+sha256sum Mobexler.ova
+Une fois l'intégrité confirmée, j'ai importé l'appliance directement dans mon hyperviseur.
+
+3. Configuration de l'Architecture Réseau
+L'isolation réseau est critique lors de l'analyse d'applications mobiles, que ce soit pour intercepter du trafic proprement ou pour éviter les fuites de données. Avant de démarrer la VM, j'ai configuré deux adaptateurs réseau distincts :
+
+Interface 1 (NAT) : Permet à Mobexler d'avoir un accès Internet stable. C'est indispensable pour télécharger des mises à jour système ou récupérer des paquets/outils complémentaires.
+
+Interface 2 (Host-Only Adapter) : Crée un réseau de laboratoire privé et isolé. Cette interface permet à la machine d'analyse de communiquer de façon sécurisée et directe avec l'appareil Android cible (qu'il soit physique ou émulé).
+
+4. Déploiement et Tests de Connectivité (Sanity Checks)
+Après le démarrage de la VM et l'authentification initiale (identifiants par défaut mobexler), j'ai validé la topologie réseau depuis le terminal.
+
+J'ai vérifié l'attribution correcte des adresses IP sur les deux interfaces configurées (typiquement un sous-réseau 10.x pour le NAT et 192.168.56.x pour le Host-Only) ainsi que la table de routage :
+
+Bash
+ip a
+ip route
+Ensuite, j'ai confirmé la sortie effective vers Internet via la passerelle NAT pour m'assurer que les futurs outils (comme les requêtes DNS proxyfiées) fonctionneront correctement :
+
+Bash
+ping -c 2 8.8.8.8
+ping -c 2 google.com
+5. Création de la Ligne de Base (Snapshot "Clean")
+L'environnement étant désormais parfaitement fonctionnel et correctement routé, j'ai figé son état en créant un snapshot nommé CLEAN_BASELINE_TP1.
+
+Cette étape est une bonne pratique fondamentale en sécurité : elle permet de réinitialiser instantanément la machine après un TP. Si l'installation de certificats d'interception (CA), la modification de règles de proxy ou l'analyse d'un malware altère le système, ce snapshot garantit un retour immédiat à un état "propre" et stable.
+
+6. Raccordement de la Cible Android (ADB)
+La dernière étape a consisté à lier l'environnement Mobexler à mon smartphone de test physique.
+
+Préparation du device : Sur le téléphone, j'ai activé le mode développeur (en tapotant 7 fois sur le "Build number") et activé l'option USB debugging.
+
+Passthrough USB : J'ai monté le périphérique USB directement depuis l'hôte vers la machine virtuelle.
+
+Validation ADB : Dans le terminal de Mobexler, j'ai initié le serveur et validé la liaison avec le pont de débogage :
+
+Bash
+adb kill-server
+adb start-server
+adb devices
+Après avoir accepté l'invite d'autorisation d'empreinte RSA sur l'écran du smartphone, l'appareil est remonté correctement avec le statut device, confirmant la liaison.
+
+(Note : Dans le cas de l'utilisation d'un émulateur comme Genymotion, la connexion se fait via l'IP Host-Only de l'émulateur avec la commande adb connect <IP_DEVICE>:5555).
