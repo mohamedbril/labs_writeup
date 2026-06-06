@@ -1,0 +1,129 @@
+Compte-Rendu de Lab 9 : Analyse de surface d'attaque Android avec DrozerDate: Sécurité des applications mobilesAnalyste : Mohamed Bril1. Introduction et Cadre de l'AuditL'objectif de ce laboratoire est d'évaluer de manière rigoureuse et purement défensive la surface d'attaque d'une application Android (VulnerableApp.apk) à l'aide du framework d'audit Drozer. Dans un contexte professionnel, cette démarche permet de cartographier l'exposition des quatre grands types de composants Android (Activities, Services, Broadcast Receivers, Content Providers) afin de détecter des failles de configuration sans altérer l'intégrité du système cible.⚖️ Réglementation et Portée (Scope) : Toutes les manipulations ont été cantonnées à un émulateur local contrôlé (API 29, architecture x86_64). Conformément aux règles d'engagement, aucune technique d'exploitation offensive n'a été menée ; l'effort s'est concentré sur l'identification, la contextualisation des risques et l'alignement avec les exigences industrielles du référentiel OWASP MASVS.2. Configuration de l'Environnement et Canal de CommunicationPour établir le canal de communication entre ma machine hôte et l'agent Drozer au sein de l'émulateur, j'ai déroulé le protocole de raccordement suivant :Vérification des outils sur l'hôteJ'ai commencé par valider la présence des utilitaires requis :Bash# Validation du pont ADB
+adb version
+# Résultat : Android Debug Bridge version 1.0.41
+
+# Validation de la présence de Drozer
+drozer --help
+Déploiement des binaires sur la cibleJ'ai poussé l'application d'analyse (l'agent) et l'application cible via ADB :Bashadb devices
+# Installation de l'infrastructure de test
+adb install drozer-agent.apk
+adb install VulnerableApp.apk
+Redirection de Port (Port Forwarding)Sur l'émulateur, j'ai ouvert manuellement l'interface graphique du Drozer Agent pour activer l'Embedded Server (qui écoute par défaut sur le port 31415). J'ai ensuite créé une règle de redirection de port sur ma machine hôte afin de lier le trafic réseau local au socket de l'émulateur :Bashadb forward tcp:31415 tcp:31415
+3. Connexion et Validation de la Console DrozerUne fois le port redirigé, j'ai initié la session interactive depuis mon terminal hôte pour valider la liaison avec l'appareil virtuel :Bash# Connexion à l'agent
+drozer console connect
+
+# Validation de l'environnement au sein de la session Drozer
+dz> device
+dz> run information.device
+Le terminal renvoie les propriétés système et la version d'Android de l'émulateur, confirmant la viabilité du canal d'analyse.4. Cartographie Exhaustive de la Surface d'AttaqueMa première action au sein de la console a été de localiser précisément le package de l'application cible et d'énumérer ses points d'exposition.Bash# Recherche du nom de package exact
+dz> run app.package.list -f vulnerable
+# Résultat : com.example.vulnerableapp
+
+# Inspection globale des métadonnées du package
+dz> run app.package.info -a com.example.vulnerableapp
+J'ai ensuite lancé une série de requêtes d'énumération pour lister l'intégralité des composants marqués comme exported="true" (visibles par toutes les autres applications installées sur l'appareil) :Bash# Énumération des activités exposées
+dz> run app.activity.info -a com.example.vulnerableapp
+
+# Énumération des services exposés
+dz> run app.service.info -a com.example.vulnerableapp
+
+# Énumération des récepteurs de diffusion (Broadcast Receivers) exposés
+dz> run app.broadcast.info -a com.example.vulnerableapp
+
+# Énumération des fournisseurs de contenu (Content Providers) exposés
+dz> run app.provider.info -a com.example.vulnerableapp
+Synthèse Initiale de l'Exposition des ComposantsType de composantNom du composantStatut ExportéProtection DétectéeActivityLoginActivityOuiAucuneActivityUserProfileActivityOuiProtégé par une Permission faibleServiceDataSyncServiceOuiAucuneReceiverBootReceiverOuiAucuneProviderUserDataProviderOuiPermissions Lecture/Écriture globales5. Inspection des Protections et Analyse des RisquesPour approfondir l'analyse sans décompiler manuellement l'APK, j'ai utilisé les modules de Drozer pour inspecter la configuration logique de l'application.Extraction du Manifeste et des Filtres d'IntentsBash# Lecture brute des permissions et structures déclarées
+dz> run app.package.manifest com.example.vulnerableapp
+
+# Analyse fine des intent-filters attachés aux activités
+dz> run app.activity.info -a com.example.vulnerableapp -i
+Audit des Points d'Accès aux Fournisseurs de Contenu (Content Providers)Les Content Providers mal configurés représentent un vecteur critique de fuite d'informations. J'ai utilisé le scanner automatisé de Drozer pour identifier les chemins d'accès (URIs) déclarés en dur :Bash# Recherche des schémas d'URI de l'application
+dz> run scanner.provider.finduris -a com.example.vulnerableapp
+
+# Test de l'exposition des URI sans permissions spécifiques
+dz> run app.provider.finduri com.example.vulnerableapp
+Évaluation Technico-Fonctionnelle des Risques ÉnumérésActivités exportées sans barrière : L'exposition de LoginActivity implique qu'une application malveillante présente sur le téléphone peut appeler cet écran de manière arbitraire. Plus grave encore, si des écrans internes subséquents sont exportés, un attaquant peut forcer l'affichage de données utilisateur en contournant l'étape d'authentification légitime.Services et Receivers en roue libre : DataSyncService et BootReceiver acceptent des requêtes de n'importe quelle application tierce. Un logiciel tiers illégitime pourrait forcer le déclenchement de synchronisations massives de données ou manipuler la logique de démarrage en injectant des Intents contrefaits.Content Providers permissifs : Si le UserDataProvider expose ses tables à travers des URI accessibles sans contrôle d'accès strict (vérifié via le module finduris), cela équivaut à offrir une porte dérobée permettant la lecture, la modification ou l'injection de données sensibles dans la base SQLite locale de l'application.6. Tableau de Triage et Alignement OWASP MASVSAfin de prioriser les corrections pour les équipes de développement, j'ai centralisé les vulnérabilités découvertes au sein d'une matrice de triage, corrélée directement avec les exigences du standard de sécurité OWASP MASVS / MASTG.Matrice de Triage (03-triage/triage.csv)Code snippetID,Composant,Vulnérabilité,Confiance,Sévérité,Impact,Recommandation,Référence OWASP,Statut
+V1,LoginActivity,Exportation injustifiée de l'activité,Élevée,Élevée,Contournement potentiel du flux d'authentification,Définir android:exported="false" dans le Manifest,MSTG-PLATFORM-1,À corriger
+V2,UserDataProvider,URI de stockage exposées sans restriction,Élevée,Critique,Exfiltration et altération de données utilisateur sensibles,Restreindre l'accès et imposer des permissions de signature,MSTG-STORAGE-2,À corriger
+V3,DataSyncService,Service exposé aux Intents arbitraires,Moyenne,Moyenne,Déclenchement intempestif d'opérations de synchronisation arrière-plan,Valider la structure des Intents et restreindre l'export,MSTG-PLATFORM-2,À corriger
+V4,BootReceiver,Broadcast Receiver ouvert sans contrôle,Élevée,Faible,Surcharge ou déclenchement malveillant lors du boot,Ajouter la permission RECEIVE_BOOT_COMPLETED,MSTG-PLATFORM-3,À surveiller
+V5,UserProfileActivity,Niveau de protection de permission insuffisant,Élevée,Moyenne,Accès illégitime au profil par élévation locale,Élever le protectionLevel de la permission à "signature",MSTG-AUTH-1,À corriger
+7. Plan de Remédiation Technique DétailléPour corriger durablement la surface d'attaque identifiée par Drozer, voici les modifications structurelles à apporter au code source de l'application.A. Correction de l'Exposition dans l'``L'analyse montre que trop de composants sont exposés par défaut. La règle d'or est de positionner explicitement android:exported="false" sauf si le composant doit impérativement interagir avec le système ou d'autres applications de confiance.XML<activity android:name=".UserProfileActivity" android:exported="true" />
+
+<service android:name=".DataSyncService" android:exported="true" />
+
+<provider
+    android:name=".UserDataProvider"
+    android:authorities="com.example.vulnerableapp.provider.userdata"
+    android:exported="true" />
+
+<activity android:name=".UserProfileActivity" android:exported="false" />
+
+<service android:name=".DataSyncService" android:exported="false" />
+
+<provider
+    android:name=".UserDataProvider"
+    android:authorities="com.example.vulnerableapp.provider.userdata"
+    android:exported="false" />
+B. Durcissement des Permissions pour les Composants PartagésSi un composant (comme un fournisseur de données ou un service de synchronisation inter-app) doit impérativement rester partagé, il faut restreindre son accès en créant une permission personnalisée avec un niveau de protection basé sur la signature cryptographique du développeur (signature).XML<permission
+    android:name="com.example.vulnerableapp.permission.READ_USER_DATA"
+    android:protectionLevel="signature" />
+
+<permission
+    android:name="com.example.vulnerableapp.permission.DATA_SYNC"
+    android:protectionLevel="signature" />
+
+<provider
+    android:name=".UserDataProvider"
+    android:authorities="com.example.vulnerableapp.provider.userdata"
+    android:exported="true"
+    android:permission="com.example.vulnerableapp.permission.READ_USER_DATA" />
+
+<service 
+    android:name=".DataSyncService" 
+    android:exported="true"
+    android:permission="com.example.vulnerableapp.permission.DATA_SYNC" />
+
+<receiver 
+    android:name=".BootReceiver" 
+    android:exported="true"
+    android:permission="android.permission.RECEIVE_BOOT_COMPLETED">
+    <intent-filter>
+        <action android:name="android.intent.action.BOOT_COMPLETED" />
+    </intent-filter>
+</receiver>
+C. Validation Programmatiquement au Niveau du Code Source JavaEn complément des déclarations d'intentions du fichier manifeste, les développeurs doivent injecter des mécanismes de validation défensive à l'entrée des composants au runtime.Sécurisation de l'accès au Content Provider (UserDataProvider.java)Java@Override
+public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
+    // 1. Validation de la structure des colonnes demandées (Anti-Injection)
+    if (!isValidProjection(projection)) {
+        throw new SecurityException("Projection non valide : tentative d'injection détectée.");
+    }
+    
+    // 2. Double vérification explicite de la permission de signature au runtime
+    if (getContext().checkCallingPermission("com.example.vulnerableapp.permission.READ_USER_DATA") 
+            != PackageManager.PERMISSION_GRANTED) {
+        throw new SecurityException("Accès refusé : signature de l'appelant non conforme.");
+    }
+    
+    // Exécution sécurisée de la requête SQLite locale
+    return database.query(TABLE_USERS, projection, selection, selectionArgs, null, null, sortOrder);
+}
+Validation des données d'entrée dans le Service (DataSyncService.java)Java@Override
+public int onStartCommand(Intent intent, int flags, int startId) {
+    // Validation stricte de l'Intent reçu pour contrer les déclenchements malveillants
+    if (intent == null || !isValidIntent(intent)) {
+        stopSelf();
+        return START_NOT_STICKY;
+    }
+    
+    // Traitement sécurisé de la tâche de synchronisation arrière-plan
+    performSynchronization();
+    return START_STICKY;
+}
+
+private boolean isValidIntent(Intent intent) {
+    // Vérification de la structure de l'action de l'Intent et de ses paramètres (Extras)
+    return "com.example.vulnerableapp.action.SYNC_DATA".equals(intent.getAction()) 
+            && intent.hasExtra("sync_token");
+}
+8. Conclusion et Clôture du LabL'utilisation combinée d'ADB et de Drozer m'a permis de réaliser un audit complet de la surface d'attaque de l'application sans recourir à de la rétro-ingénierie lourde. Les vulnérabilités identifiées mettent en lumière des erreurs de configuration récurrentes dans l'écosystème Android (exportation aveugle de composants via l'ajout implicite d'intent-filters, manque de permissions de signature).Avant de clore définitivement la séance de test, j'ai appliqué la procédure de nettoyage requise pour restituer un environnement sain :Fermeture sécurisée de la console Drozer (commande exit).Suppression de la règle de port forwarding sur l'hôte : adb forward --remove tcp:31415.Désactivation manuelle du serveur embarqué au sein de l'application Drozer Agent sur l'émulateur pour refermer le port d'écoute réseau.Validation de la conformité du livrable en cochant l'intégralité des points de contrôle de confidentialité de mon fichier checklist_fin.md.
