@@ -1,0 +1,105 @@
+1. Introduction et Objectifs du Challenge
+L'objectif de ce laboratoire est de documenter la résolution complète du challenge Snake, classé en catégorie Mobile Hard. L'application Android fournie met en œuvre plusieurs barrières de protection pour bloquer l'analyse dynamique standard (anti-root, anti-émulateur et anti-Frida via une bibliothèque native).
+
+L'analyse de l'APK a révélé l'utilisation d'une version vulnérable de la bibliothèque SnakeYAML (v1.33, sujette à la CVE-2022-1471), permettant une désérialisation non sécurisée (unsafe deserialization). Le but est de contourner les protections d'environnement par modification statique du bytecode, puis d'exploiter la faille de désérialisation pour forcer l'instanciation d'une classe masquée nommée BigBoss. Cette dernière appelle une fonction JNI native qui génère le flag et l'envoie dans les logs système Android (logcat).
+
+2. Étape 1 : Analyse Statique Approfondie (Jadx-GUI)
+En ouvrant l'APK original dans Jadx-GUI, j'ai cartographié la structure du code source de l'application sous le package principal com.pwnsec.snake.
+
+Analyse de la Classe MainActivity
+La logique d'entrée examine les composants de l'Intent de démarrage (onCreate) :
+
+Elle recherche la présence d'un extra Intent spécifique nommé SNAKE. Sa valeur doit correspondre exactement à la chaîne BigBoss.
+
+Si cette condition est validée, l'application tente de lire le stockage externe de l'appareil (chemin standard /sdcard/ ou /storage/emulated/0/).
+
+Elle y cherche un dossier nommé Snake, puis tente de parser un fichier de configuration nommé Skull_Face.yml en utilisant l'implémentation vulnérable de SnakeYAML.
+
+Analyse de la Classe Cible BigBoss (com.pwnsec.snake.BigBoss)
+Cette classe, bien que présente dans le package, n'est jamais appelée dans le flux d'exécution normal de l'application. Elle contient les éléments clés suivants :
+
+Un bloc statique chargeant une bibliothèque native : System.loadLibrary(...).
+
+Une méthode/constructeur acceptant un paramètre de type chaîne de caractères.
+
+Une structure conditionnelle vérifiant si l'argument reçu est strictement égal à Snaaaaaaaaaaaaaake.
+
+Si l'argument est correct, la méthode appelle la fonction native stringFromJNI(), chargée de générer dynamiquement le flag à l'aide d'opérations masquées au sein du binaire compilé (ce qui explique pourquoi le flag n'apparaît pas en clair dans le code Java).
+
+Mécanismes de Protection Détectés
+L'application implémente des vérifications agressives au démarrage :
+
+Anti-Root : Inspection de Build.TAGS (test-keys), détection du binaire su, et présence d'APK de gestion des super-utilisateurs (ex: Superuser.apk).
+
+Anti-Émulateur : Vérification des propriétés système (ro.hardware, ro.product.model).
+
+Anti-Frida : Validation effectuée au niveau natif par vérification des ports d'écoute ou des processus en mémoire. En conséquence, l'utilisation de Frida ou d'un appareil de test standard provoque la fermeture immédiate de l'application.
+
+3. Étape 2 : Patching Smali des Détections (apktool)
+L'utilisation de Frida étant compromise par les vérifications natives, la modification statique du code de protection s'avère obligatoire pour forcer l'application à s'exécuter sur mon émulateur.
+
+Décompilation de l'APK
+J'ai extrait les fichiers au niveau Smali à l'aide d'apktool :
+
+Bash
+apktool d snake.apk -o snake_smali
+cd snake_smali/smali/com/pwnsec/snake/
+Modification des Conditions Logiques
+En recoupant les emplacements des fonctions de détection identifiées préalablement sous Jadx, j'ai ouvert les fichiers .smali correspondants. Les méthodes de vérification renvoyant généralement un booléen (true si une anomalie est détectée, provoquant l'arrêt), j'ai appliqué deux techniques de patching :
+
+Remplacement des instructions de saut conditionnel (if-nez / if-eqz) par un saut inconditionnel (goto) pointant directement vers le bloc d'exécution sain.
+
+Forçage systématique des registres de retour à 0x0 (false) juste avant l'instruction return. Par exemple :
+
+Smali
+const/4 v0, 0x0
+return v0
+Recompilation et Signature
+Une fois le contournement des protections injecté, j'ai reconstruit l'APK modifié et l'ai signé avec un keystore de test afin de permettre son installation sur le système :
+
+Bash
+apktool b snake_smali -o snake_patched.apk
+apksigner sign --ks mon_keystore.jks snake_patched.apk
+J'ai ensuite déployé l'APK patché sur l'émulateur (recommandé en API 28 pour maximiser la compatibilité avec les droits d'écriture) :
+
+Bash
+adb install -r snake_patched.apk
+4. Étape 3 : Conception du Payload YAML (Exploitation CVE-2022-1471)
+La vulnérabilité CVE-2022-1471 réside dans le fait que la classe Yaml de SnakeYAML (versions < 2.0) permet par défaut l'instanciation de classes arbitraires via les balises globales (global tags).
+
+Création de l'arborescence sur l'appareil
+J'ai initialisé le répertoire attendu par l'application sur le stockage partagé :
+
+Bash
+adb shell mkdir -p /sdcard/Snake
+Écriture du Payload
+J'ai créé localement le fichier de configuration malveillant Skull_Face.yml avec le contenu suivant :
+
+YAML
+!!com.pwnsec.snake.BigBoss ["Snaaaaaaaaaaaaaake"]
+Explication du mécanisme d'exploitation :
+
+!!com.pwnsec.snake.BigBoss agit comme un pointeur de type d'objet. Lors du parsing, SnakeYAML va utiliser la réflexion Java pour instancier directement la classe spécifiée.
+
+["Snaaaaaaaaaaaaaake"] fournit l'argument nécessaire au constructeur. Lors de l'analyse du document YAML, la bibliothèque appelle l'initialisation de l'objet en injectant cette chaîne exacte. Cela valide la condition interne et déclenche l'exécution du code natif JNI lié à la génération du flag.
+
+J'ai poussé le payload dans l'arborescence de l'appareil :
+
+Bash
+adb push Skull_Face.yml /sdcard/Snake/Skull_Face.yml
+5. Étape 4 : Exécution et Capture du Flag
+L'environnement étant préparé et le payload en place, il ne reste plus qu'à réveiller la logique de lecture de l'application en simulant l'Intent attendu.
+
+Déclenchement par Intent ADB
+J'ai ciblé la MainActivity en y adjoignant l'extra textuel requis pour passer le premier contrôle de validation :
+
+Bash
+adb shell am start -n com.pwnsec.snake/.MainActivity -e SNAKE BigBoss
+Interception dans Logcat
+Comme la fonction native JNI écrit le résultat directement dans la journalisation système Android sans l'afficher sur l'interface graphique de l'application, j'ai mis en écoute un filtre sur mon terminal hôte :
+
+Bash
+adb logcat | grep -i "PWNSEC"
+Flag Obtenu
+Plaintext
+PWNSEC{W3'r3_N0t_T00l5_0f_The_g0v3rnm3n7_0R_4ny0n3_3ls3}
